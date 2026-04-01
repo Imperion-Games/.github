@@ -2,6 +2,11 @@
 # Called by .github/workflows/release.yml in each individual plugin repo.
 # Triggered when a tag matching v[Major].[Minor] is pushed.
 #
+# Modes:
+#   full        — 0.x tags and v1.0: rebuilds the ## [1.0] changelog section from all commits,
+#                 triggers a full docs page regeneration
+#   incremental — v1.1 and beyond: appends a new changelog entry, updates only changed docs sections
+#
 # Required secrets (set at org level or per repo):
 #   ANTHROPIC_API_KEY    — Anthropic API key for changelog generation
 #   DOCS_DISPATCH_TOKEN  — GitHub PAT with repo scope for toamig/toamig.github.io
@@ -48,75 +53,128 @@ jobs:
 
           VERSION_INT=$(python3 -c "import json; print(json.load(open('$UPLUGIN')).get('Version', 1))")
 
+          # Determine mode:
+          #   full        — 0.x (pre-release) or 1.0 (first public release)
+          #   incremental — 1.1 and beyond
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          if [ "$MAJOR" -eq 0 ] || { [ "$MAJOR" -eq 1 ] && [ "$MINOR" -eq 0 ]; }; then
+            MODE="full"
+          else
+            MODE="incremental"
+          fi
+
           echo "version=$VERSION"           >> $GITHUB_OUTPUT
           echo "plugin_name=$PLUGIN_NAME"   >> $GITHUB_OUTPUT
           echo "uplugin=$UPLUGIN"           >> $GITHUB_OUTPUT
           echo "version_int=$VERSION_INT"   >> $GITHUB_OUTPUT
+          echo "mode=$MODE"                 >> $GITHUB_OUTPUT
 
-      # ── 3. Collect commits between the previous tag and this tag ──────────
-      - name: Collect commits
-        id: commits
+      # ── 3. Validate version ordering — tags must always move forward ───────
+      - name: Validate version ordering
         run: |
           CURRENT_TAG="${{ github.ref_name }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          NEW_MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          NEW_MINOR=$(echo "$VERSION" | cut -d. -f2)
+          NEW_INT=$((NEW_MAJOR * 10000 + NEW_MINOR))
+
           PREV_TAG=$(git tag --sort=-version:refname \
             | grep -E '^v[0-9]+\.[0-9]+$' \
             | grep -v "^${CURRENT_TAG}$" \
             | head -1)
 
-          if [ -z "$PREV_TAG" ]; then
-            RAW=$(git log "$CURRENT_TAG" --pretty=format:"%s")
-            IS_FIRST=true
+          if [ -n "$PREV_TAG" ]; then
+            PREV_VERSION="${PREV_TAG#v}"
+            PREV_MAJOR=$(echo "$PREV_VERSION" | cut -d. -f1)
+            PREV_MINOR=$(echo "$PREV_VERSION" | cut -d. -f2)
+            PREV_INT=$((PREV_MAJOR * 10000 + PREV_MINOR))
+
+            if [ "$NEW_INT" -le "$PREV_INT" ]; then
+              echo "::error::v$VERSION is not greater than the current latest tag $PREV_TAG. Version tags cannot go backwards."
+              exit 1
+            fi
+
+            echo "Version check passed: $PREV_TAG → v$VERSION"
           else
-            RAW=$(git log "${PREV_TAG}..${CURRENT_TAG}" --pretty=format:"%s")
-            IS_FIRST=false
+            echo "No previous tags — first tag allowed."
+          fi
+
+      # ── 4. Collect commits ────────────────────────────────────────────────
+      - name: Collect commits
+        id: commits
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          MODE="${{ steps.meta.outputs.mode }}"
+
+          PREV_TAG=$(git tag --sort=-version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+$' \
+            | grep -v "^${CURRENT_TAG}$" \
+            | head -1)
+
+          if [ "$MODE" = "full" ]; then
+            # Full mode: all commits from the beginning — building the complete 1.0 picture
+            RAW=$(git log "$CURRENT_TAG" --pretty=format:"%s")
+          else
+            # Incremental: only commits since the last tag
+            if [ -z "$PREV_TAG" ]; then
+              RAW=$(git log "$CURRENT_TAG" --pretty=format:"%s")
+            else
+              RAW=$(git log "${PREV_TAG}..${CURRENT_TAG}" --pretty=format:"%s")
+            fi
           fi
 
           # Strip automated release commits and merge commits
           COMMITS=$(echo "$RAW" | grep -v "^Merge\|^chore: release")
 
-          echo "is_first=$IS_FIRST" >> $GITHUB_OUTPUT
           {
             echo "commits<<COMMITS_EOF"
             echo "$COMMITS"
             echo "COMMITS_EOF"
           } >> $GITHUB_OUTPUT
 
-      # ── 4. Call Anthropic API to generate a changelog entry ───────────────
+      # ── 5. Generate changelog entry via Anthropic API ─────────────────────
       - name: Generate changelog entry
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PLUGIN_NAME:       ${{ steps.meta.outputs.plugin_name }}
           VERSION:           ${{ steps.meta.outputs.version }}
-          IS_FIRST:          ${{ steps.commits.outputs.is_first }}
+          MODE:              ${{ steps.meta.outputs.mode }}
           COMMITS:           ${{ steps.commits.outputs.commits }}
         run: |
           python3 << 'PYEOF'
-          import os, json, urllib.request
+          import os, json, re, urllib.request
 
-          plugin   = os.environ["PLUGIN_NAME"]
-          version  = os.environ["VERSION"]
-          commits  = os.environ["COMMITS"].strip()
-          is_first = os.environ["IS_FIRST"] == "true"
+          plugin  = os.environ["PLUGIN_NAME"]
+          version = os.environ["VERSION"]
+          mode    = os.environ["MODE"]
+          commits = os.environ["COMMITS"].strip()
 
           if not commits:
               print("No commits found — skipping changelog generation")
               exit(0)
 
+          is_full = mode == "full"
+
+          # Full mode always writes to ## [1.0] — the pre-release snapshot and the final 1.0 entry
+          # are the same section, replaced each time until the real 1.0 ships.
+          changelog_version = "1.0" if is_full else version
+
           release_context = (
-              "This is the FIRST release (1.0.0).\n"
-              "Document what the plugin ships with, organized by domain section.\n"
-              "There is NO Fixed section — nothing was released before, so nothing was broken.\n"
-              "IGNORE all bug fix, correction, or pre-release fix commits entirely — those are\n"
-              "development history, not changelog material. Only document features and systems."
-          ) if is_first else (
+              "This is a pre-release development snapshot building toward the 1.0 public release.\n"
+              "Document ALL features and systems the plugin currently ships with, organized by domain.\n"
+              "NO Fixed section — pre-release corrections are development history, not changelog material.\n"
+              "Ignore ALL bug fix, correction, or internal fix commits. Features and systems only.\n"
+              "This entry will be replaced on the next pre-release tag — write it as the current complete state."
+          ) if is_full else (
               "This is a post-release update.\n"
               "Include only user-visible changes: new features, behavior changes, QoL improvements.\n"
               "A ### Fixed section is allowed ONLY for user-facing crash fixes or wrong-output fixes.\n"
               "Skip entirely: internal refactors, test changes, CI changes, documentation updates,\n"
-              "and any fixes made before the plugin was ever released."
+              "and any fixes made before the plugin was ever publicly released."
           )
 
-          prompt = f"""Write a CHANGELOG.md entry for the {plugin} Unreal Engine 5 plugin, version {version}.
+          prompt = f"""Write a CHANGELOG.md entry for the {plugin} Unreal Engine 5 plugin.
 
 {release_context}
 
@@ -124,14 +182,14 @@ Commits to process:
 {commits}
 
 Format rules:
-- Section names must reflect the plugin's domain (e.g. "Combo System", "Inventory", "Targeting", "World Pickups") — never generic labels like "Features" or "Changes"
+- Section names must reflect the plugin's domain (e.g. "Combo System", "Inventory", "Targeting") — never generic labels
 - Plain declarative sentences — no leading verbs like "Added" or "Fixed" on each bullet
 - No dates on the version header
 - One level of bullet points only
 
-Output ONLY the markdown — no explanations, no code fences, nothing before ## [{version}].
+Output ONLY the markdown — no explanations, no code fences, nothing before ## [{changelog_version}].
 
-## [{version}]
+## [{changelog_version}]
 
 ### Section Name
 - Entry
@@ -158,30 +216,53 @@ Output ONLY the markdown — no explanations, no code fences, nothing before ## 
 
           entry = data["content"][0]["text"].strip()
 
-          # Merge into CHANGELOG.md — insert after the first "---" separator
-          if os.path.exists("CHANGELOG.md"):
-              with open("CHANGELOG.md") as f:
-                  existing = f.read()
-              if "---\n" in existing:
-                  idx = existing.index("---\n") + 4
-                  new_content = existing[:idx] + "\n" + entry + "\n\n" + existing[idx:].lstrip("\n")
+          if is_full:
+              # Replace the existing ## [1.0] section, or insert after the header separator
+              if os.path.exists("CHANGELOG.md"):
+                  with open("CHANGELOG.md") as f:
+                      existing = f.read()
+                  pattern = r'## \[1\.0\].*?(?=\n## \[|\Z)'
+                  if re.search(pattern, existing, re.DOTALL):
+                      new_content = re.sub(pattern, entry.rstrip(), existing, flags=re.DOTALL)
+                      if not new_content.endswith("\n"):
+                          new_content += "\n"
+                  elif "---\n" in existing:
+                      idx = existing.index("---\n") + 4
+                      new_content = existing[:idx] + "\n" + entry + "\n"
+                  else:
+                      new_content = existing.rstrip() + "\n\n" + entry + "\n"
               else:
-                  new_content = existing.rstrip() + "\n\n" + entry + "\n"
+                  header = (
+                      "# Changelog\n\n"
+                      "Supported engine versions: **UE 5.7+** (developed and tested on UE 5.7)\n\n"
+                      "---\n\n"
+                  )
+                  new_content = header + entry + "\n"
           else:
-              header = (
-                  "# Changelog\n\n"
-                  "Supported engine versions: **UE 5.7+** (developed and tested on UE 5.7)\n\n"
-                  "---\n\n"
-              )
-              new_content = header + entry + "\n"
+              # Insert new version entry after the header separator
+              if os.path.exists("CHANGELOG.md"):
+                  with open("CHANGELOG.md") as f:
+                      existing = f.read()
+                  if "---\n" in existing:
+                      idx = existing.index("---\n") + 4
+                      new_content = existing[:idx] + "\n" + entry + "\n\n" + existing[idx:].lstrip("\n")
+                  else:
+                      new_content = existing.rstrip() + "\n\n" + entry + "\n"
+              else:
+                  header = (
+                      "# Changelog\n\n"
+                      "Supported engine versions: **UE 5.7+** (developed and tested on UE 5.7)\n\n"
+                      "---\n\n"
+                  )
+                  new_content = header + entry + "\n"
 
           with open("CHANGELOG.md", "w") as f:
               f.write(new_content)
 
-          print(f"Changelog entry written for v{version}")
+          print(f"Changelog written — mode={mode}, version={changelog_version}")
           PYEOF
 
-      # ── 5. Bump Version (int + 1) and VersionName in the .uplugin ─────────
+      # ── 6. Bump Version (int + 1) and VersionName in the .uplugin ─────────
       - name: Bump .uplugin version
         env:
           UPLUGIN:      ${{ steps.meta.outputs.uplugin }}
@@ -209,7 +290,7 @@ Output ONLY the markdown — no explanations, no code fences, nothing before ## 
           print(f"Version {old_int} → {new_int}, VersionName = {version}")
           PYEOF
 
-      # ── 6. Commit CHANGELOG.md + .uplugin back to main ───────────────────
+      # ── 7. Commit CHANGELOG.md + .uplugin back to main ───────────────────
       - name: Commit and push
         run: |
           git config user.name  "github-actions[bot]"
@@ -222,7 +303,7 @@ Output ONLY the markdown — no explanations, no code fences, nothing before ## 
           git commit -m "chore: release v${{ steps.meta.outputs.version }}"
           git push origin main
 
-      # ── 7. Notify docs repo ───────────────────────────────────────────────
+      # ── 8. Notify docs repo ───────────────────────────────────────────────
       - name: Dispatch to docs repo
         env:
           DOCS_DISPATCH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
@@ -237,6 +318,7 @@ Output ONLY the markdown — no explanations, no code fences, nothing before ## 
               \"client_payload\": {
                 \"plugin_name\": \"${{ steps.meta.outputs.plugin_name }}\",
                 \"version\":     \"${{ steps.meta.outputs.version }}\",
-                \"plugin_repo\": \"${{ github.repository }}\"
+                \"plugin_repo\": \"${{ github.repository }}\",
+                \"mode\":        \"${{ steps.meta.outputs.mode }}\"
               }
             }"
