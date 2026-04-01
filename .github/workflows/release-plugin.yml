@@ -197,7 +197,7 @@ jobs:
           )
 
           payload = {
-              "model": "claude-opus-4-6",
+              "model": "claude-haiku-4-5-20251001",
               "max_tokens": 2048,
               "messages": [{"role": "user", "content": prompt}]
           }
@@ -212,8 +212,12 @@ jobs:
               }
           )
 
-          with urllib.request.urlopen(req) as resp:
-              data = json.loads(resp.read())
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  data = json.loads(resp.read())
+          except urllib.error.HTTPError as e:
+              print(f"API error {e.code}: {e.read().decode()}")
+              raise
 
           entry = data["content"][0]["text"].strip()
 
