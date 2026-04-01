@@ -174,26 +174,27 @@ jobs:
               "and any fixes made before the plugin was ever publicly released."
           )
 
-          prompt = f"""Write a CHANGELOG.md entry for the {plugin} Unreal Engine 5 plugin.
-
-{release_context}
-
-Commits to process:
-{commits}
-
-Format rules:
-- Section names must reflect the plugin's domain (e.g. "Combo System", "Inventory", "Targeting") — never generic labels
-- Plain declarative sentences — no leading verbs like "Added" or "Fixed" on each bullet
-- No dates on the version header
-- One level of bullet points only
-
-Output ONLY the markdown — no explanations, no code fences, nothing before ## [{changelog_version}].
-
-## [{changelog_version}]
-
-### Section Name
-- Entry
-"""
+          prompt = (
+              f"Write a CHANGELOG.md entry for the {plugin} Unreal Engine 5 plugin.\n"
+              f"\n"
+              f"{release_context}\n"
+              f"\n"
+              f"Commits to process:\n"
+              f"{commits}\n"
+              f"\n"
+              f"Format rules:\n"
+              f"- Section names must reflect the plugin's domain (e.g. \"Combo System\", \"Inventory\", \"Targeting\") — never generic labels\n"
+              f"- Plain declarative sentences — no leading verbs like \"Added\" or \"Fixed\" on each bullet\n"
+              f"- No dates on the version header\n"
+              f"- One level of bullet points only\n"
+              f"\n"
+              f"Output ONLY the markdown — no explanations, no code fences, nothing before ## [{changelog_version}].\n"
+              f"\n"
+              f"## [{changelog_version}]\n"
+              f"\n"
+              f"### Section Name\n"
+              f"- Entry\n"
+          )
 
           payload = {
               "model": "claude-opus-4-6",
