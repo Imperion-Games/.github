@@ -268,26 +268,29 @@ Output ONLY the markdown — no explanations, no code fences, nothing before ## 
           UPLUGIN:      ${{ steps.meta.outputs.uplugin }}
           VERSION:      ${{ steps.meta.outputs.version }}
           VERSION_INT:  ${{ steps.meta.outputs.version_int }}
+          PLUGIN_NAME:  ${{ steps.meta.outputs.plugin_name }}
         run: |
           python3 << 'PYEOF'
           import json, os
 
-          path    = os.environ["UPLUGIN"]
-          version = os.environ["VERSION"]
-          old_int = int(os.environ["VERSION_INT"])
-          new_int = old_int + 1
+          path        = os.environ["UPLUGIN"]
+          version     = os.environ["VERSION"]
+          old_int     = int(os.environ["VERSION_INT"])
+          plugin_name = os.environ["PLUGIN_NAME"]
+          new_int     = old_int + 1
 
           with open(path) as f:
               data = json.load(f)
 
           data["Version"]     = new_int
           data["VersionName"] = version
+          data["DocsURL"]     = f"https://migueltechlead.pt/Plugins/{plugin_name}"
 
           with open(path, "w") as f:
               json.dump(data, f, indent="\t")
               f.write("\n")
 
-          print(f"Version {old_int} → {new_int}, VersionName = {version}")
+          print(f"Version {old_int} → {new_int}, VersionName = {version}, DocsURL = {data['DocsURL']}")
           PYEOF
 
       # ── 7. Commit CHANGELOG.md + .uplugin back to main ───────────────────
