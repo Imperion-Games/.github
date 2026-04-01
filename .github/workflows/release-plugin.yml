@@ -1,0 +1,239 @@
+# Reusable workflow — lives in Imperion-Games/.github repo
+# Called by .github/workflows/release.yml in each individual plugin repo.
+# Triggered when a tag matching v[Major].[Minor] is pushed.
+#
+# Required secrets (set at org level or per repo):
+#   ANTHROPIC_API_KEY    — Anthropic API key for changelog generation
+#   DOCS_DISPATCH_TOKEN  — GitHub PAT with repo scope for toamig/toamig.github.io
+
+name: Release Plugin
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout main (not the tag) so we can commit back ──────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Extract plugin name + version from tag and .uplugin ────────────
+      - name: Extract metadata
+        id: meta
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          UPLUGIN=$(find . -maxdepth 3 -name "*.uplugin" | grep -v "/.git/" | head -1)
+          if [ -z "$UPLUGIN" ]; then
+            echo "::error::No .uplugin file found in repository"
+            exit 1
+          fi
+
+          PLUGIN_NAME=$(python3 -c "
+          import json, sys
+          d = json.load(open('$UPLUGIN'))
+          print(d.get('FriendlyName') or d.get('Name') or sys.argv[1])
+          " "${{ github.event.repository.name }}")
+
+          VERSION_INT=$(python3 -c "import json; print(json.load(open('$UPLUGIN')).get('Version', 1))")
+
+          echo "version=$VERSION"           >> $GITHUB_OUTPUT
+          echo "plugin_name=$PLUGIN_NAME"   >> $GITHUB_OUTPUT
+          echo "uplugin=$UPLUGIN"           >> $GITHUB_OUTPUT
+          echo "version_int=$VERSION_INT"   >> $GITHUB_OUTPUT
+
+      # ── 3. Collect commits between the previous tag and this tag ──────────
+      - name: Collect commits
+        id: commits
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+$' \
+            | grep -v "^${CURRENT_TAG}$" \
+            | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            RAW=$(git log "$CURRENT_TAG" --pretty=format:"%s")
+            IS_FIRST=true
+          else
+            RAW=$(git log "${PREV_TAG}..${CURRENT_TAG}" --pretty=format:"%s")
+            IS_FIRST=false
+          fi
+
+          # Strip automated release commits and merge commits
+          COMMITS=$(echo "$RAW" | grep -v "^Merge\|^chore: release")
+
+          echo "is_first=$IS_FIRST" >> $GITHUB_OUTPUT
+          {
+            echo "commits<<COMMITS_EOF"
+            echo "$COMMITS"
+            echo "COMMITS_EOF"
+          } >> $GITHUB_OUTPUT
+
+      # ── 4. Call Anthropic API to generate a changelog entry ───────────────
+      - name: Generate changelog entry
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PLUGIN_NAME:       ${{ steps.meta.outputs.plugin_name }}
+          VERSION:           ${{ steps.meta.outputs.version }}
+          IS_FIRST:          ${{ steps.commits.outputs.is_first }}
+          COMMITS:           ${{ steps.commits.outputs.commits }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, urllib.request
+
+          plugin   = os.environ["PLUGIN_NAME"]
+          version  = os.environ["VERSION"]
+          commits  = os.environ["COMMITS"].strip()
+          is_first = os.environ["IS_FIRST"] == "true"
+
+          if not commits:
+              print("No commits found — skipping changelog generation")
+              exit(0)
+
+          release_context = (
+              "This is the FIRST release (1.0.0).\n"
+              "List everything the plugin ships with, organized by domain section.\n"
+              "There is NO Fixed section — nothing was released before, so nothing was broken."
+          ) if is_first else (
+              "This is a post-release update.\n"
+              "Include only user-visible changes: new features, behavior changes, QoL improvements.\n"
+              "A ### Fixed section is allowed ONLY for user-facing crash fixes or wrong-output fixes.\n"
+              "Skip entirely: internal refactors, test changes, CI changes, documentation updates."
+          )
+
+          prompt = f"""Write a CHANGELOG.md entry for the {plugin} Unreal Engine 5 plugin, version {version}.
+
+{release_context}
+
+Commits to process:
+{commits}
+
+Format rules:
+- Section names must reflect the plugin's domain (e.g. "Combo System", "Inventory", "Targeting", "World Pickups") — never generic labels like "Features" or "Changes"
+- Plain declarative sentences — no leading verbs like "Added" or "Fixed" on each bullet
+- No dates on the version header
+- One level of bullet points only
+
+Output ONLY the markdown — no explanations, no code fences, nothing before ## [{version}].
+
+## [{version}]
+
+### Section Name
+- Entry
+"""
+
+          payload = {
+              "model": "claude-opus-4-6",
+              "max_tokens": 2048,
+              "messages": [{"role": "user", "content": prompt}]
+          }
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+              }
+          )
+
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+
+          entry = data["content"][0]["text"].strip()
+
+          # Merge into CHANGELOG.md — insert after the first "---" separator
+          if os.path.exists("CHANGELOG.md"):
+              with open("CHANGELOG.md") as f:
+                  existing = f.read()
+              if "---\n" in existing:
+                  idx = existing.index("---\n") + 4
+                  new_content = existing[:idx] + "\n" + entry + "\n\n" + existing[idx:].lstrip("\n")
+              else:
+                  new_content = existing.rstrip() + "\n\n" + entry + "\n"
+          else:
+              header = (
+                  "# Changelog\n\n"
+                  "Supported engine versions: **UE 5.7+** (developed and tested on UE 5.7)\n\n"
+                  "---\n\n"
+              )
+              new_content = header + entry + "\n"
+
+          with open("CHANGELOG.md", "w") as f:
+              f.write(new_content)
+
+          print(f"Changelog entry written for v{version}")
+          PYEOF
+
+      # ── 5. Bump Version (int + 1) and VersionName in the .uplugin ─────────
+      - name: Bump .uplugin version
+        env:
+          UPLUGIN:      ${{ steps.meta.outputs.uplugin }}
+          VERSION:      ${{ steps.meta.outputs.version }}
+          VERSION_INT:  ${{ steps.meta.outputs.version_int }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          path    = os.environ["UPLUGIN"]
+          version = os.environ["VERSION"]
+          old_int = int(os.environ["VERSION_INT"])
+          new_int = old_int + 1
+
+          with open(path) as f:
+              data = json.load(f)
+
+          data["Version"]     = new_int
+          data["VersionName"] = version
+
+          with open(path, "w") as f:
+              json.dump(data, f, indent="\t")
+              f.write("\n")
+
+          print(f"Version {old_int} → {new_int}, VersionName = {version}")
+          PYEOF
+
+      # ── 6. Commit CHANGELOG.md + .uplugin back to main ───────────────────
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md "${{ steps.meta.outputs.uplugin }}"
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore: release v${{ steps.meta.outputs.version }}"
+          git push origin main
+
+      # ── 7. Notify docs repo ───────────────────────────────────────────────
+      - name: Dispatch to docs repo
+        env:
+          DOCS_DISPATCH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $DOCS_DISPATCH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/toamig/toamig.github.io/dispatches \
+            -d "{
+              \"event_type\": \"plugin-released\",
+              \"client_payload\": {
+                \"plugin_name\": \"${{ steps.meta.outputs.plugin_name }}\",
+                \"version\":     \"${{ steps.meta.outputs.version }}\",
+                \"plugin_repo\": \"${{ github.repository }}\"
+              }
+            }"
