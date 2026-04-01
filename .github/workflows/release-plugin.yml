@@ -104,13 +104,16 @@ jobs:
 
           release_context = (
               "This is the FIRST release (1.0.0).\n"
-              "List everything the plugin ships with, organized by domain section.\n"
-              "There is NO Fixed section — nothing was released before, so nothing was broken."
+              "Document what the plugin ships with, organized by domain section.\n"
+              "There is NO Fixed section — nothing was released before, so nothing was broken.\n"
+              "IGNORE all bug fix, correction, or pre-release fix commits entirely — those are\n"
+              "development history, not changelog material. Only document features and systems."
           ) if is_first else (
               "This is a post-release update.\n"
               "Include only user-visible changes: new features, behavior changes, QoL improvements.\n"
               "A ### Fixed section is allowed ONLY for user-facing crash fixes or wrong-output fixes.\n"
-              "Skip entirely: internal refactors, test changes, CI changes, documentation updates."
+              "Skip entirely: internal refactors, test changes, CI changes, documentation updates,\n"
+              "and any fixes made before the plugin was ever released."
           )
 
           prompt = f"""Write a CHANGELOG.md entry for the {plugin} Unreal Engine 5 plugin, version {version}.
