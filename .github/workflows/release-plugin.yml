@@ -7,6 +7,18 @@
 #                 triggers a full docs page regeneration
 #   incremental — v1.1 and beyond: appends a new changelog entry, updates only changed docs sections
 #
+# Skip-API marker:
+#   Annotated tags whose body contains [skip-api] or [skip-notes] cause this workflow
+#   to bypass every step that calls the Anthropic API or dispatches to the docs repo.
+#   The tag itself is still pushed and the GitHub Release can be created by the caller
+#   (e.g. Plugins/ModularPlugins/tools/PublishRelease.ps1 -SkipApi). The marker travels
+#   inside the tag annotation, which arrives at GitHub atomically with the push — no
+#   race condition with workflow-disable propagation.
+#
+#   To create a skip-marker tag locally:
+#     git tag -a v0.5 -m "[skip-api] release v0.5"
+#     git push origin v0.5
+#
 # Required secrets (set at org level or per repo):
 #   ANTHROPIC_API_KEY    — Anthropic API key for changelog generation
 #   DOCS_DISPATCH_TOKEN  — GitHub PAT with repo scope for toamig/toamig.github.io
@@ -31,6 +43,28 @@ jobs:
           ref: main
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 1b. Check for skip-API marker in tag annotation ───────────────────
+      # If the annotated tag body contains [skip-api] or [skip-notes], every
+      # downstream step that calls the Anthropic API or dispatches to the docs
+      # repo is gated off. The marker travels inside the tag annotation, which
+      # arrives at GitHub atomically with the push — so unlike `gh workflow
+      # disable`, there is no propagation race.
+      - name: Check for skip marker
+        id: skip_check
+        run: |
+          TAG="${{ github.ref_name }}"
+          # `git tag -l --format='%(contents)'` prints the annotation body for
+          # annotated tags and an empty string for lightweight tags. Either way
+          # it never fails — we just inspect the result.
+          TAG_MSG=$(git tag -l --format='%(contents)' "$TAG")
+          if echo "$TAG_MSG" | grep -qE '\[skip-api\]|\[skip-notes\]'; then
+            echo "Tag $TAG annotation contains a skip marker — API-touching steps will be skipped."
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $TAG has no skip marker — running full pipeline."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # ── 2. Extract plugin name + version from tag and .uplugin ────────────
       - name: Extract metadata
@@ -135,6 +169,7 @@ jobs:
 
       # ── 5. Generate changelog entry via Anthropic API ─────────────────────
       - name: Generate changelog entry
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PLUGIN_NAME:       ${{ steps.meta.outputs.plugin_name }}
@@ -269,6 +304,7 @@ jobs:
 
       # ── 6. Bump Version (int + 1) and VersionName in the .uplugin ─────────
       - name: Bump .uplugin version
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           UPLUGIN:      ${{ steps.meta.outputs.uplugin }}
           VERSION:      ${{ steps.meta.outputs.version }}
@@ -300,6 +336,7 @@ jobs:
 
       # ── 7. Commit CHANGELOG.md + .uplugin back to main ───────────────────
       - name: Commit and push
+        if: steps.skip_check.outputs.skip != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -313,6 +350,7 @@ jobs:
 
       # ── 8. Notify docs repo ───────────────────────────────────────────────
       - name: Dispatch to docs repo
+        if: steps.skip_check.outputs.skip != 'true'
         env:
           DOCS_DISPATCH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: |
